@@ -262,6 +262,7 @@ func (wa *WhatsAppClient) contactToUserInfo(ctx context.Context, jid types.JID, 
 	}
 	ui := &bridgev2.UserInfo{
 		Name:         ptr.Ptr(wa.Main.Config.FormatDisplayname(jid, phone, contact)),
+		FullName:     &contact.FullName,
 		IsBot:        ptr.Ptr(jid.IsBot()),
 		ExtraUpdates: updateGhostLastSyncAt,
 	}
