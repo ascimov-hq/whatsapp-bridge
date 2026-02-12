@@ -52,3 +52,5 @@ require (
 	gopkg.in/natefinch/lumberjack.v2 v2.2.1 // indirect
 	maunium.net/go/mauflag v1.0.0 // indirect
 )
+
+replace maunium.net/go/mautrix => github.com/ascimov-hq/mautrix-go v0.0.0-20260314003910-ca6042ad3019
