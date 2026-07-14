@@ -279,6 +279,23 @@ func (wa *WhatsAppClient) contactToUserInfo(ctx context.Context, jid types.JID, 
 	return ui
 }
 
+func (wa *WhatsAppClient) ResolveIdentifiers(ctx context.Context, userID networkid.UserID) []string {
+	jid := waid.ParseUserID(userID)
+	switch jid.Server {
+	case types.BotServer:
+		return nil
+	case types.DefaultUserServer:
+		return []string{"tel:+" + jid.User}
+	case types.HiddenUserServer:
+		if pn, err := wa.GetStore().LIDs.GetPNForLID(ctx, jid); err == nil && !pn.IsEmpty() {
+			return []string{"tel:+" + pn.User}
+		}
+		return nil
+	default:
+		return nil
+	}
+}
+
 func updateGhostLastSyncAt(_ context.Context, ghost *bridgev2.Ghost) bool {
 	meta := ghost.Metadata.(*waid.GhostMetadata)
 	forceSave := ResyncMinInterval < 24*time.Hour || time.Since(meta.LastSync.Time) > 24*time.Hour
