@@ -29,7 +29,6 @@ func main() {
 			m.Matrix.Provisioning.Router.HandleFunc("GET /v1/contacts", legacyProvContacts)
 			m.Matrix.Provisioning.Router.HandleFunc("GET /v1/resolve_identifier/{number}", legacyProvResolveIdentifier)
 			m.Matrix.Provisioning.Router.HandleFunc("POST /v1/pm/{number}", legacyProvResolveIdentifier)
-			m.Matrix.Provisioning.Router.HandleFunc("POST /v3/contacts-lookup", provContactLookup)
 			m.Matrix.Provisioning.Router.HandleFunc("POST /v1/debug/appstate/{patch}", provAppStateDebug)
 			m.Matrix.Provisioning.Router.HandleFunc("POST /v1/debug/recover-appstate/{patch}", provRecoverAppStateDebug)
 		}
