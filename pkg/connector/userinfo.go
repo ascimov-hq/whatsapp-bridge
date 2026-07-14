@@ -264,6 +264,12 @@ func (wa *WhatsAppClient) contactToUserInfo(ctx context.Context, jid types.JID, 
 	}
 	if jid.Server == types.BotServer {
 		ui.Identifiers = []string{}
+	} else if jid.Server == types.HiddenUserServer {
+		// Always stamp the LID so clients can identify the user even if PN is unknown.
+		ui.Identifiers = []string{"lid:" + jid.User}
+		if phone != "" {
+			ui.Identifiers = append(ui.Identifiers, fmt.Sprintf("tel:%s", phone))
+		}
 	} else if phone != "" {
 		ui.Identifiers = []string{fmt.Sprintf("tel:%s", phone)}
 	}
@@ -271,6 +277,39 @@ func (wa *WhatsAppClient) contactToUserInfo(ctx context.Context, jid types.JID, 
 		ui.ExtraUpdates = bridgev2.MergeExtraUpdaters(ui.ExtraUpdates, wa.fetchGhostAvatar)
 	}
 	return ui
+}
+
+// ResolveIdentifiers implements bridgev2.IdentifierResolver.
+// It returns the stable identifiers for a remote WhatsApp user.
+//
+// PN JID  → ["tel:+<number>"]
+// LID JID → ["lid:<lid>"]  or ["lid:<lid>", "tel:+<number>"] if PN mapping is known
+// Bot JID → nil
+func (wa *WhatsAppClient) ResolveIdentifiers(ctx context.Context, userID networkid.UserID) []string {
+	jid := waid.ParseUserID(userID)
+	switch jid.Server {
+	case types.BotServer:
+		return nil
+	case types.DefaultUserServer:
+		return []string{"tel:+" + jid.User}
+	case types.HiddenUserServer:
+		idents := []string{"lid:" + jid.User}
+		if pn, err := wa.GetStore().LIDs.GetPNForLID(ctx, jid); err == nil && !pn.IsEmpty() {
+			idents = append(idents, "tel:+"+pn.User)
+		}
+		return idents
+	default:
+		return nil
+	}
+}
+
+// ResolveLoginIdentifiers implements bridgev2.UserLoginIdentifierResolver.
+// It returns the phone number of the bridge user themselves.
+func (wa *WhatsAppClient) ResolveLoginIdentifiers(_ context.Context) []string {
+	if wa.Client == nil || wa.Client.Store.ID == nil || wa.Client.Store.ID.IsEmpty() {
+		return nil
+	}
+	return []string{"tel:+" + wa.Client.Store.ID.User}
 }
 
 func updateGhostLastSyncAt(_ context.Context, ghost *bridgev2.Ghost) bool {

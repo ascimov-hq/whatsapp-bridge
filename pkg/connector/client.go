@@ -86,6 +86,12 @@ func (wa *WhatsAppConnector) LoadUserLogin(ctx context.Context, login *bridgev2.
 		w.Client.SetForceActiveDeliveryReceipts(wa.Config.ForceActiveDeliveryReceipts)
 		w.Client.InitialAutoReconnect = wa.Config.InitialAutoReconnect
 		w.Client.UseRetryMessageStore = wa.Config.UseWhatsAppRetryStore
+		if idents := w.ResolveLoginIdentifiers(ctx); len(idents) > 0 {
+			login.Identifiers = idents
+			if err := wa.Bridge.DB.UserLogin.Update(ctx, login.UserLogin); err != nil {
+				w.UserLogin.Log.Err(err).Msg("Failed to persist login identifiers")
+			}
+		}
 	} else {
 		w.UserLogin.Log.Warn().Stringer("jid", w.JID).Msg("No device found for user in whatsmeow store")
 	}
