@@ -39,11 +39,36 @@ type UserLoginMetadata struct {
 	APNSEncPrivKey  []byte        `json:"apns_enc_privkey,omitempty"`
 	LoggedInAt      jsontime.Unix `json:"logged_in_at,omitempty"`
 
+	// intbox: start of the current history import of this WhatsApp account. Unlike LoggedInAt, it's kept
+	// when the same account is paired again within intbox.reimport_after, so a re-pair doesn't import the
+	// same chats again. Logins created before this field existed don't have it: use GetImportEpoch.
+	ImportEpoch jsontime.Unix `json:"import_epoch,omitzero"`
+	// intbox: when the last contact resync of this login finished (cooldown for automatic resyncs).
+	LastContactResync jsontime.Unix `json:"last_contact_resync,omitzero"`
+
 	AppStateRecoveryAttempted map[appstate.WAPatchName]time.Time `json:"app_state_recovery_attempted,omitempty"`
 
 	HistorySyncPortalsNeedCreating bool `json:"history_sync_portals_need_creating,omitempty"`
 
 	MData json.RawMessage `json:"mdata,omitempty"`
+}
+
+// GetImportEpoch returns the start of the current history import: ImportEpoch, or LoggedInAt for logins
+// that were created before ImportEpoch existed (for those the import always started at the last pairing).
+func (m *UserLoginMetadata) GetImportEpoch() jsontime.Unix {
+	if m == nil {
+		return jsontime.Unix{}
+	} else if !m.ImportEpoch.IsZero() {
+		return m.ImportEpoch
+	}
+	return m.LoggedInAt
+}
+
+// ImportEpochCarried returns true if the import epoch started before the current pairing, i.e. this pairing
+// is a re-pair of an account whose import state was kept (see intbox.reimport_after).
+func (m *UserLoginMetadata) ImportEpochCarried() bool {
+	epoch := m.GetImportEpoch()
+	return !epoch.IsZero() && !m.LoggedInAt.IsZero() && epoch.Before(m.LoggedInAt.Time)
 }
 
 type PushKeys struct {

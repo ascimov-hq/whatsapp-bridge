@@ -57,6 +57,15 @@ func (wa *WhatsAppConnector) LoadUserLogin(ctx context.Context, login *bridgev2.
 		createDedup:               exsync.NewSet[types.MessageID](),
 		appStateFullSyncAttempted: make(map[appstate.WAPatchName]time.Time),
 	}
+	// intbox: every instance owns a lifetime context for its background work (see intbox_lifecycle.go)
+	w.lifeCtx, w.lifeCancel = context.WithCancelCause(login.Log.WithContext(wa.Bridge.BackgroundCtx))
+	if old, ok := login.Client.(*WhatsAppClient); ok && old != nil && old != w {
+		// bridgev2 reuses the UserLogin when the same account is paired again (NewLogin), so the previous
+		// instance must be stopped here: its event handlers are removed and its background work is cancelled,
+		// so it can't change the login (metadata, bridge state) after this point. A re-pair with a different
+		// companion device has already retired it with a remote logout in WALogin.completeLogin.
+		old.retire(ctx, errClientReplaced, false)
+	}
 	login.Client = w
 
 	loginMetadata := login.Metadata.(*waid.UserLoginMetadata)
@@ -82,7 +91,7 @@ func (wa *WhatsAppConnector) LoadUserLogin(ctx context.Context, login *bridgev2.
 		w.Client.AutomaticMessageRerequestFromPhone = true
 		w.Client.GetMessageForRetry = w.trackNotFoundRetry
 		w.Client.PreRetryCallback = w.trackFoundRetry
-		w.Client.BackgroundEventCtx = w.UserLogin.Log.WithContext(wa.Bridge.BackgroundCtx)
+		w.Client.BackgroundEventCtx = w.lifeCtx
 		w.Client.SetForceActiveDeliveryReceipts(wa.Config.ForceActiveDeliveryReceipts)
 		w.Client.InitialAutoReconnect = wa.Config.InitialAutoReconnect
 		w.Client.UseRetryMessageStore = wa.Config.UseWhatsAppRetryStore
@@ -119,9 +128,22 @@ type WhatsAppClient struct {
 	pushNamesSynced    *exsync.Event
 	lastPresence       types.Presence
 	createDedup        *exsync.Set[types.MessageID]
+	contactResync      contactResyncRunner
+	historySyncPortals historySyncPortalState
 
 	appStateRecoveryLock      sync.Mutex
 	appStateFullSyncAttempted map[appstate.WAPatchName]time.Time
+
+	// intbox: lifetime of this instance, see intbox_lifecycle.go
+	lifeCtx    context.Context
+	lifeCancel context.CancelCauseFunc
+	retired    atomic.Bool
+	noopWarned atomic.Bool
+	// Set by retire() when it starts closing the socket of this instance, see Disconnect
+	teardown atomic.Pointer[retireTeardown]
+	// Only set by tests
+	bridgeStateHook func(status.BridgeState)
+	retireConnHook  retireConn
 }
 
 var (
@@ -189,12 +211,20 @@ func (wa *WhatsAppClient) IsThisUser(_ context.Context, userID networkid.UserID)
 }
 
 func (wa *WhatsAppClient) Connect(ctx context.Context) {
+	if !wa.isActiveInstance() {
+		// A replaced instance must never send states for the login
+		zerolog.Ctx(ctx).Debug().Msg("Not connecting replaced client instance")
+		return
+	}
 	if wa.Client == nil {
 		state := status.BridgeState{
 			StateEvent: status.StateBadCredentials,
 			Error:      WANotLoggedIn,
 		}
 		wa.UserLogin.BridgeState.Send(state)
+		return
+	} else if wa.retired.Load() {
+		zerolog.Ctx(ctx).Debug().Msg("Not connecting retired client instance")
 		return
 	}
 	wa.UserLogin.BridgeState.Send(status.BridgeState{StateEvent: status.StateConnecting})
@@ -207,7 +237,7 @@ func (wa *WhatsAppClient) Connect(ctx context.Context) {
 	}
 	wa.initMC()
 	wa.startLoops()
-	wa.Client.BackgroundEventCtx = wa.UserLogin.Log.WithContext(wa.Main.Bridge.BackgroundCtx)
+	wa.Client.BackgroundEventCtx = wa.lifeContext()
 	zerolog.Ctx(ctx).Debug().Msg("Connecting to WhatsApp")
 	if err := wa.Client.ConnectContext(ctx); err != nil {
 		wa.callStopLoops()
@@ -252,7 +282,7 @@ func (wa *WhatsAppClient) ConnectBackground(ctx context.Context, params *bridgev
 	if wa.Client == nil {
 		return bridgev2.ErrNotLoggedIn
 	}
-	wa.Client.BackgroundEventCtx = wa.UserLogin.Log.WithContext(wa.Main.Bridge.BackgroundCtx)
+	wa.Client.BackgroundEventCtx = wa.lifeContext()
 	ch := make(chan error, 1)
 	wa.offlineSyncWaiter.Store(&ch)
 	defer wa.offlineSyncWaiter.Store(nil)
@@ -332,7 +362,8 @@ func (wa *WhatsAppClient) sendPNData(ctx context.Context, pn string) error {
 }
 
 func (wa *WhatsAppClient) startLoops() {
-	ctx, cancel := context.WithCancel(wa.Main.Bridge.BackgroundCtx)
+	// intbox: the loops are also stopped when this instance is retired (lifeContext is cancelled)
+	ctx, cancel := context.WithCancel(wa.lifeContext())
 	oldStop := wa.stopLoops.Swap(&cancel)
 	if oldStop != nil {
 		(*oldStop)()
@@ -351,7 +382,13 @@ func (wa *WhatsAppClient) GetStore() *store.Device {
 			return currentStore
 		}
 	}
-	wa.UserLogin.Log.Warn().Caller(1).Msg("Returning noop device in GetStore")
+	// intbox: a logged out or replaced instance used to log this on every call (16k warnings per minute in the
+	// 4 Oct incident). Warn once per instance, then only at trace level.
+	if wa.noopWarned.CompareAndSwap(false, true) {
+		wa.UserLogin.Log.Warn().Caller(1).Bool("retired", wa.retired.Load()).Msg("Returning noop device in GetStore")
+	} else {
+		wa.UserLogin.Log.Trace().Caller(1).Msg("Returning noop device in GetStore")
+	}
 	return store.NoopDevice
 }
 
@@ -363,13 +400,29 @@ func (wa *WhatsAppClient) callStopLoops() {
 
 func (wa *WhatsAppClient) Disconnect() {
 	wa.callStopLoops()
+	if td := wa.teardown.Load(); td != nil {
+		// intbox: this instance was retired, and retire() closes its socket itself. bridgev2 disconnects a replaced
+		// client again after NewLogin installed the new one (upstream 0748d1e), which must not reach whatsmeow:
+		// whatsmeow's Disconnect fails every pending request, so it would abort the remote logout of a replaced
+		// companion device (leaving it in the phone's linked devices), and it waits for the socket lock (held
+		// for a whole dial if the old socket was reconnecting) while NewLogin holds the bridge-wide cache lock.
+		// Without a remote logout, wait until the socket is closed, as callers of Disconnect expect. That's the
+		// same wait as whatsmeow's own Disconnect, and it doesn't depend on running event handlers.
+		if !td.logoutRemote {
+			<-td.socketClosed
+		}
+		return
+	}
 	if cli := wa.Client; cli != nil {
 		cli.Disconnect()
 	}
 }
 
 func (wa *WhatsAppClient) LogoutRemote(ctx context.Context) {
+	// intbox: the login is being deleted, so stop all background work of this instance first
+	wa.markRetired(errClientLoggedOutBridge)
 	if cli := wa.Client; cli != nil {
+		cli.RemoveEventHandlers()
 		err := cli.Logout(ctx)
 		if err != nil {
 			zerolog.Ctx(ctx).Err(err).Msg("Failed to log out")
@@ -384,6 +437,10 @@ func (wa *WhatsAppClient) IsLoggedIn() bool {
 }
 
 func (wa *WhatsAppClient) syncRemoteProfile(ctx context.Context, ghost *bridgev2.Ghost) {
+	if ctx.Err() != nil || !wa.isCurrent() {
+		// intbox: a replaced instance must not overwrite the remote profile or send a bridge state
+		return
+	}
 	ownID := waid.MakeUserID(wa.GetStore().GetJID())
 	if ghost == nil {
 		var err error

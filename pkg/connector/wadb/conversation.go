@@ -117,6 +117,21 @@ const (
 		SET synced_login_ts=$4
 		WHERE bridge_id=$1 AND user_login_id=$2 AND chat_jid=$3
 	`
+	countSyncedConversationsQuery = `
+		SELECT COUNT(*) FROM whatsapp_history_sync_conversation
+		WHERE bridge_id=$1 AND user_login_id=$2 AND synced_login_ts >= $3
+	`
+	// Same as getRecentConversations, plus synced_login_ts
+	getImportCandidatesQuery = `
+		SELECT
+			bridge_id, user_login_id, chat_jid, last_message_timestamp, archived, pinned, mute_end_time,
+			end_of_history_transfer_type, ephemeral_expiration, ephemeral_setting_timestamp, marked_as_unread,
+			unread_count, synced_login_ts
+		FROM whatsapp_history_sync_conversation
+		WHERE bridge_id=$1 AND user_login_id=$2 AND (synced_login_ts IS NULL OR synced_login_ts < $4)
+		ORDER BY last_message_timestamp DESC
+		LIMIT $3
+	`
 )
 
 func (cq *ConversationQuery) Put(ctx context.Context, conv *Conversation) error {
@@ -137,6 +152,66 @@ func (cq *ConversationQuery) GetRecent(
 
 func (cq *ConversationQuery) MarkSynced(ctx context.Context, loginID networkid.UserLoginID, chatJID types.JID, loginTS jsontime.Unix) error {
 	return cq.Exec(ctx, markConversationSynced, cq.BridgeID, loginID, chatJID, loginTS)
+}
+
+// CountSynced returns the number of conversations that have been bridged since the given login timestamp.
+// The connector passes the import epoch, so conversations bridged before a re-pair within
+// intbox.reimport_after still count against the per-login room cap.
+func (cq *ConversationQuery) CountSynced(ctx context.Context, loginID networkid.UserLoginID, loginTS jsontime.Unix) (count int, err error) {
+	err = cq.GetDB().QueryRow(ctx, countSyncedConversationsQuery, cq.BridgeID, loginID, loginTS).Scan(&count)
+	return
+}
+
+// ImportCandidate is a history sync conversation that hasn't been handled in the current pairing yet.
+type ImportCandidate struct {
+	*Conversation
+	// When the conversation was last marked as synced (zero if never)
+	SyncedLoginTS jsontime.Unix
+}
+
+// SyncedSince returns true if the conversation was marked as synced at or after the given timestamp,
+// e.g. imported earlier in the current import epoch (before a re-pair).
+func (ic *ImportCandidate) SyncedSince(ts jsontime.Unix) bool {
+	return !ic.SyncedLoginTS.IsZero() && ic.SyncedLoginTS.Unix() >= ts.Unix()
+}
+
+// scannableWithExtra appends extra scan targets after the ones passed to Scan,
+// so that Conversation.Scan can be reused for queries with extra columns.
+type scannableWithExtra struct {
+	dbutil.Scannable
+	extra []any
+}
+
+func (s scannableWithExtra) Scan(dest ...any) error {
+	return s.Scannable.Scan(append(dest, s.extra...)...)
+}
+
+func scanImportCandidate(row dbutil.Scannable) (*ImportCandidate, error) {
+	var syncedLoginTS sql.NullInt64
+	conv, err := (&Conversation{}).Scan(scannableWithExtra{Scannable: row, extra: []any{&syncedLoginTS}})
+	if err != nil {
+		return nil, err
+	}
+	ic := &ImportCandidate{Conversation: conv}
+	if syncedLoginTS.Valid {
+		ic.SyncedLoginTS = jsontime.UInt(syncedLoginTS.Int64)
+	}
+	return ic, nil
+}
+
+// GetImportCandidates returns the most recent conversations that haven't been marked as synced at or after
+// notSyncedSince (the current pairing), like GetRecent, and remembers when each was last synced, so that
+// the caller can tell conversations imported earlier in the import epoch apart (see ImportCandidate.SyncedSince).
+func (cq *ConversationQuery) GetImportCandidates(
+	ctx context.Context, loginID networkid.UserLoginID, limit int, notSyncedSince jsontime.Unix,
+) ([]*ImportCandidate, error) {
+	limitPtr := &limit
+	// Negative limit on SQLite means unlimited, but Postgres prefers a NULL limit.
+	if limit < 0 && cq.GetDB().Dialect == dbutil.Postgres {
+		limitPtr = nil
+	}
+	rows, err := cq.GetDB().Query(ctx, getImportCandidatesQuery, cq.BridgeID, loginID, limitPtr, notSyncedSince)
+	return dbutil.ConvertRowFn[*ImportCandidate](scanImportCandidate).NewRowIter(rows, err).AsList()
 }
 
 func (cq *ConversationQuery) Get(ctx context.Context, loginID networkid.UserLoginID, chatJID types.JID) (*Conversation, error) {

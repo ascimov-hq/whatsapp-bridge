@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/rs/zerolog"
+	"go.mau.fi/util/dbutil"
 	"go.mau.fi/util/exzerolog"
 	"go.mau.fi/util/jsontime"
 	"go.mau.fi/util/ptr"
@@ -19,6 +20,8 @@ import (
 	"maunium.net/go/mautrix/bridgev2"
 	"maunium.net/go/mautrix/bridgev2/networkid"
 	"maunium.net/go/mautrix/bridgev2/simplevent"
+	"maunium.net/go/mautrix/event"
+	"maunium.net/go/mautrix/id"
 
 	"go.mau.fi/mautrix-whatsapp/pkg/connector/wadb"
 	"go.mau.fi/mautrix-whatsapp/pkg/waid"
@@ -382,9 +385,49 @@ func (wa *WhatsAppClient) fetchGhostAvatar(ctx context.Context, ghost *bridgev2.
 	return ghost.UpdateAvatar(ctx, wrappedAvatar)
 }
 
-func (wa *WhatsAppClient) resyncContacts(forceAvatarSync, automatic bool) {
+// resyncContacts applies the contact info from the WhatsApp contact store to ghosts.
+//
+// Unless allContacts is set, only ghosts that are already joined to a portal room of this login are updated.
+// Updating a ghost registers it on the homeserver and fetches its profile and avatar, which is wasted work
+// for contacts that aren't in any room (most of the address book). Ghosts that join a room later get the
+// same info through GetUserInfo, and the contact list provisioning APIs read the contact store directly.
+//
+// intbox: automatic resyncs (after the critical_unblock_low app state sync, i.e. after every pairing) are skipped
+// if the last resync of this login finished less than intbox.contact_resync_cooldown ago. That time is carried
+// over to a re-pair within intbox.reimport_after. Only one resync runs per client instance: a request made while
+// one is running is merged into exactly one rerun after it (see contactResyncRunner).
+func (wa *WhatsAppClient) resyncContacts(forceAvatarSync, automatic, allContacts bool) {
 	log := wa.UserLogin.Log.With().Str("action", "resync contacts").Logger()
-	ctx := log.WithContext(wa.Main.Bridge.BackgroundCtx)
+	if !wa.isCurrent() {
+		log.Debug().Msg("Not resyncing contacts on a replaced or logged out client instance")
+		return
+	}
+	if automatic {
+		cooldown := wa.Main.Config.Intbox.ContactResyncCooldown
+		lastResync := wa.UserLogin.Metadata.(*waid.UserLoginMetadata).LastContactResync
+		if contactResyncOnCooldown(lastResync, cooldown, time.Now()) {
+			log.Info().
+				Time("last_contact_resync", lastResync.Time).
+				Stringer("cooldown", cooldown).
+				Msg("Skipping automatic contact resync, contacts were resynced recently")
+			return
+		}
+	}
+	req := contactResyncRequest{forceAvatarSync: forceAvatarSync, automatic: automatic, allContacts: allContacts}
+	if !wa.contactResync.run(req, wa.doResyncContacts) {
+		log.Debug().Msg("Contact resync is already in progress, it will run once more after it finishes")
+	}
+}
+
+// doResyncContacts runs one contact resync on the instance's lifetime context.
+func (wa *WhatsAppClient) doResyncContacts(req contactResyncRequest) {
+	forceAvatarSync, automatic, allContacts := req.forceAvatarSync, req.automatic, req.allContacts
+	log := wa.UserLogin.Log.With().Str("action", "resync contacts").Logger()
+	ctx := log.WithContext(wa.lifeContext())
+	if ctx.Err() != nil || !wa.isCurrent() {
+		log.Debug().Msg("Not resyncing contacts on a replaced or logged out client instance")
+		return
+	}
 	if automatic && wa.isNewLogin {
 		log.Debug().Msg("Waiting for push name history sync before resyncing contacts")
 		timeoutCtx, cancel := context.WithTimeout(ctx, 5*time.Minute)
@@ -400,9 +443,40 @@ func (wa *WhatsAppClient) resyncContacts(forceAvatarSync, automatic bool) {
 		log.Err(err).Msg("Failed to get cached contacts")
 		return
 	}
+	if !allContacts {
+		joinedGhosts, err := wa.getJoinedGhostIDs(ctx)
+		if err != nil {
+			log.Err(err).Msg("Failed to get ghosts in portal rooms, not resyncing contacts")
+			return
+		}
+		log.Info().
+			Int("contact_count", len(contacts)).
+			Int("joined_ghost_count", len(joinedGhosts)).
+			Msg("Resyncing displaynames with contact info for ghosts in portal rooms")
+		var syncedCount, skippedCount int
+		for jid := range contacts {
+			if ctx.Err() != nil || !wa.isCurrent() {
+				log.Info().Msg("Stopping contact resync, the client instance was replaced or logged out")
+				return
+			}
+			if wa.resyncJoinedContact(ctx, jid, forceAvatarSync, joinedGhosts) {
+				syncedCount++
+			} else {
+				skippedCount++
+			}
+		}
+		log.Info().
+			Int("synced_count", syncedCount).
+			Int("skipped_count", skippedCount).
+			Msg("Finished resyncing displaynames with contact info")
+		wa.markContactResyncDone(ctx)
+		return
+	}
 	log.Info().Int("contact_count", len(contacts)).Msg("Resyncing displaynames with contact info")
+	defer wa.markContactResyncDone(ctx)
 	for jid := range contacts {
-		if ctx.Err() != nil {
+		if ctx.Err() != nil || !wa.isCurrent() {
+			log.Info().Msg("Stopping contact resync, the client instance was replaced or logged out")
 			return
 		}
 		ghost, err := wa.Main.Bridge.GetGhostByID(ctx, waid.MakeUserID(jid))
@@ -420,8 +494,120 @@ func (wa *WhatsAppClient) resyncContacts(forceAvatarSync, automatic bool) {
 	}
 }
 
-func (wa *WhatsAppClient) syncAltGhostWithInfo(ctx context.Context, jid types.JID, info *bridgev2.UserInfo) {
+// markContactResyncDone stores when the contact resync of this login last finished (intbox.contact_resync_cooldown).
+// Nothing is stored if the resync was interrupted or the instance isn't current anymore.
+func (wa *WhatsAppClient) markContactResyncDone(ctx context.Context) {
+	if ctx.Err() != nil || !wa.isCurrent() {
+		return
+	}
+	wa.UserLogin.Metadata.(*waid.UserLoginMetadata).LastContactResync = jsontime.UnixNow()
+	if err := wa.UserLogin.Save(ctx); err != nil {
+		zerolog.Ctx(ctx).Err(err).Msg("Failed to save last contact resync time")
+	}
+}
+
+// resyncJoinedContact applies the contact info of the given JID to its ghost and to the ghost of its
+// alternate JID (LID <-> phone number), but only to the ones that are joined to a portal room.
+// Returns false if neither ghost is joined.
+func (wa *WhatsAppClient) resyncJoinedContact(ctx context.Context, jid types.JID, forceAvatarSync bool, joinedGhosts map[networkid.UserID]struct{}) bool {
 	log := zerolog.Ctx(ctx)
+	targets := make([]types.JID, 0, 2)
+	if _, joined := joinedGhosts[waid.MakeUserID(jid)]; joined {
+		targets = append(targets, jid)
+	}
+	if altJID := wa.getAltJIDForGhostSync(ctx, jid); !altJID.IsEmpty() {
+		if _, joined := joinedGhosts[waid.MakeUserID(altJID)]; joined {
+			targets = append(targets, altJID)
+		}
+	}
+	if len(targets) == 0 {
+		return false
+	}
+	// Refetch contact info from the store to reduce the risk of races.
+	// This should always hit the cache.
+	contact, err := wa.GetStore().Contacts.GetContact(ctx, jid)
+	if err != nil {
+		log.Err(err).Stringer("jid", jid).Msg("Failed to get contact info")
+		return true
+	}
+	for _, target := range targets {
+		ghost, err := wa.Main.Bridge.GetExistingGhostByID(ctx, waid.MakeUserID(target))
+		if err != nil {
+			log.Err(err).Stringer("jid", target).Msg("Failed to get ghost")
+			continue
+		} else if ghost == nil {
+			continue
+		}
+		ghost.UpdateInfo(ctx, wa.contactToUserInfo(ctx, jid, contact, forceAvatarSync || ghost.AvatarID == ""))
+		if target != jid {
+			log.Debug().
+				Stringer("jid", jid).
+				Stringer("alternate_jid", target).
+				Msg("Synced alternate ghost with info")
+			go wa.syncRemoteProfile(ctx, ghost)
+		}
+	}
+	return true
+}
+
+// getJoinedGhostIDs returns the IDs of all ghosts that are joined to at least one portal room of this login,
+// according to the bridge's Matrix state store. This is a single query rather than one per contact,
+// because mx_user_profile isn't indexed by user ID.
+func (wa *WhatsAppClient) getJoinedGhostIDs(ctx context.Context) (map[networkid.UserID]struct{}, error) {
+	joined := make(map[networkid.UserID]struct{})
+	err := userIDConverter.
+		NewRowIter(wa.Main.Bridge.DB.Query(ctx, getJoinedGhostsInLoginPortalsQuery, wa.Main.Bridge.ID, wa.UserLogin.ID)).
+		Iter(func(userID id.UserID) (bool, error) {
+			if ghostID, ok := wa.Main.Bridge.Matrix.ParseGhostMXID(userID); ok {
+				joined[ghostID] = struct{}{}
+			}
+			return true, nil
+		})
+	return joined, err
+}
+
+var userIDConverter = dbutil.ConvertRowFn[id.UserID](dbutil.ScanSingleColumn[id.UserID])
+
+const getJoinedGhostsInLoginPortalsQuery = `
+	SELECT DISTINCT mx_user_profile.user_id
+	FROM mx_user_profile
+	INNER JOIN portal ON portal.mxid=mx_user_profile.room_id
+	INNER JOIN user_portal
+		ON user_portal.bridge_id=portal.bridge_id
+		AND user_portal.portal_id=portal.id
+		AND user_portal.portal_receiver=portal.receiver
+	WHERE portal.bridge_id=$1 AND user_portal.login_id=$2 AND mx_user_profile.membership='join'
+`
+
+type ghostMXIDFormatter interface {
+	FormatGhostMXID(userID networkid.UserID) id.UserID
+}
+
+func (wa *WhatsAppClient) formatGhostMXID(userID networkid.UserID) id.UserID {
+	if formatter, ok := wa.Main.Bridge.Matrix.(ghostMXIDFormatter); ok {
+		return formatter.FormatGhostMXID(userID)
+	}
+	return wa.Main.Bridge.Matrix.GhostIntent(userID).GetMXID()
+}
+
+// isGhostJoinedToRoom checks whether the given ghost is joined to the given room according to the bridge's
+// Matrix state store. If the state store lookup fails, the ghost is assumed to be joined.
+func (wa *WhatsAppClient) isGhostJoinedToRoom(ctx context.Context, roomID id.RoomID, userID networkid.UserID) bool {
+	if roomID == "" {
+		return false
+	}
+	member, err := wa.Main.Bridge.Matrix.GetMemberInfo(ctx, roomID, wa.formatGhostMXID(userID))
+	if err != nil {
+		zerolog.Ctx(ctx).Warn().Err(err).
+			Stringer("room_id", roomID).
+			Str("ghost_id", string(userID)).
+			Msg("Failed to check ghost membership in state store")
+		return true
+	}
+	return member != nil && member.Membership == event.MembershipJoin
+}
+
+func (wa *WhatsAppClient) getAltJIDForGhostSync(ctx context.Context, jid types.JID) types.JID {
 	var altJID types.JID
 	var err error
 	if jid.Server == types.HiddenUserServer {
@@ -430,19 +616,31 @@ func (wa *WhatsAppClient) syncAltGhostWithInfo(ctx context.Context, jid types.JI
 		altJID, err = wa.GetStore().LIDs.GetLIDForPN(ctx, jid)
 	}
 	if err != nil {
-		log.Warn().Err(err).
+		zerolog.Ctx(ctx).Warn().Err(err).
 			Stringer("jid", jid).
 			Msg("Failed to get alternate JID for syncing user info")
-		return
-	} else if altJID.IsEmpty() {
+		return types.EmptyJID
+	}
+	return altJID
+}
+
+// syncAltGhostWithInfo applies the given info to the ghost of the alternate JID (LID <-> phone number).
+// Ghosts that don't exist yet are not created: they will get the same info from GetUserInfo if they
+// ever join a room, and creating one registers it on the homeserver and fetches its profile and avatar.
+func (wa *WhatsAppClient) syncAltGhostWithInfo(ctx context.Context, jid types.JID, info *bridgev2.UserInfo) {
+	log := zerolog.Ctx(ctx)
+	altJID := wa.getAltJIDForGhostSync(ctx, jid)
+	if altJID.IsEmpty() {
 		return
 	}
-	ghost, err := wa.Main.Bridge.GetGhostByID(ctx, waid.MakeUserID(altJID))
+	ghost, err := wa.Main.Bridge.GetExistingGhostByID(ctx, waid.MakeUserID(altJID))
 	if err != nil {
 		log.Err(err).
 			Stringer("alternate_jid", altJID).
 			Stringer("jid", jid).
 			Msg("Failed to get ghost for alternate JID")
+		return
+	} else if ghost == nil {
 		return
 	}
 	ghost.UpdateInfo(ctx, info)

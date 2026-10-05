@@ -47,6 +47,15 @@ const (
 			WHERE bridge_id=$1 AND user_login_id=$2 AND chat_jid=$3
 		)
 	`
+	// intbox (L7-1): the size of a login's pending import, for the admission lanes. The LIMIT keeps it an index-only
+	// scan of at most $3 rows of the primary key, even for an account with 100k+ buffered messages.
+	countHistorySyncMessagesQuery = `
+		SELECT COUNT(*) FROM (
+			SELECT 1 FROM whatsapp_history_sync_message
+			WHERE bridge_id=$1 AND user_login_id=$2
+			LIMIT $3
+		) AS buffered
+	`
 )
 
 type HistorySyncMessageTuple struct {
@@ -135,6 +144,13 @@ func (mq *MessageQuery) DeleteAllInChat(ctx context.Context, loginID networkid.U
 		return 0, err
 	}
 	return res.RowsAffected()
+}
+
+// CountHistorySyncMessages returns how many history sync messages of the login are buffered (not backfilled yet),
+// counting at most limit of them.
+func (mq *MessageQuery) CountHistorySyncMessages(ctx context.Context, loginID networkid.UserLoginID, limit int) (count int, err error) {
+	err = mq.QueryRow(ctx, countHistorySyncMessagesQuery, mq.BridgeID, loginID, limit).Scan(&count)
+	return
 }
 
 func (mq *MessageQuery) ConversationHasMessages(ctx context.Context, loginID networkid.UserLoginID, chatJID types.JID) (exists bool, err error) {

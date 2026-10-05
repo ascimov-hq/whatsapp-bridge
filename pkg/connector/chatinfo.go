@@ -16,6 +16,7 @@ import (
 	"maunium.net/go/mautrix/bridgev2/database"
 	"maunium.net/go/mautrix/bridgev2/networkid"
 	"maunium.net/go/mautrix/event"
+	"maunium.net/go/mautrix/id"
 
 	"go.mau.fi/mautrix-whatsapp/pkg/connector/wadb"
 	"go.mau.fi/mautrix-whatsapp/pkg/waid"
@@ -253,11 +254,12 @@ func (wa *WhatsAppClient) wrapGroupInfo(ctx context.Context, info *types.GroupIn
 		setAddressingMode(info.AddressingMode),
 		setTopicID(info.TopicID, info.Topic),
 	)
+	syncAllMembers := wa.Main.Config.MaxMemberSync < 0 || len(info.Participants) < wa.Main.Config.MaxMemberSync
 	wrapped := &bridgev2.ChatInfo{
 		Name:  ptr.Ptr(info.Name),
 		Topic: ptr.Ptr(info.Topic),
 		Members: &bridgev2.ChatMemberList{
-			IsFull:           !info.IsIncognito && !info.IsParent,
+			IsFull:           !info.IsIncognito && !info.IsParent && syncAllMembers,
 			TotalMemberCount: len(info.Participants),
 			MemberMap:        make(map[networkid.UserID]bridgev2.ChatMember, len(info.Participants)),
 			PowerLevels: &bridgev2.PowerLevelOverrides{
@@ -285,6 +287,8 @@ func (wa *WhatsAppClient) wrapGroupInfo(ctx context.Context, info *types.GroupIn
 		ExtraUpdates: extraUpdater,
 	}
 	var hasSelf bool
+	var portalMXID id.RoomID
+	var portalLookedUp bool
 	for _, pcp := range info.Participants {
 		member := bridgev2.ChatMember{
 			EventSender: wa.makeEventSender(ctx, pcp.JID),
@@ -298,6 +302,9 @@ func (wa *WhatsAppClient) wrapGroupInfo(ctx context.Context, info *types.GroupIn
 		} else if pcp.IsAdmin {
 			member.PowerLevel = ptr.Ptr(adminPL)
 		} else {
+			if !syncAllMembers && !member.EventSender.IsFromMe {
+				continue
+			}
 			member.PowerLevel = ptr.Ptr(defaultPL)
 		}
 		member.MemberEventExtra = map[string]any{
@@ -305,6 +312,16 @@ func (wa *WhatsAppClient) wrapGroupInfo(ctx context.Context, info *types.GroupIn
 		}
 		wrapped.Members.MemberMap.Set(member)
 		if pcp.JID.Server == types.HiddenUserServer && !pcp.PhoneNumber.IsEmpty() {
+			// The leave event for the phone number ghost only does something if that ghost is in the room
+			// (i.e. the group was bridged before it switched to LID addressing). Otherwise bridgev2 would
+			// create, register and sync the profile and avatar of the ghost only to then do nothing with it.
+			if !portalLookedUp {
+				portalLookedUp = true
+				portalMXID = wa.getExistingPortalMXID(ctx, info.JID)
+			}
+			if !wa.isGhostJoinedToRoom(ctx, portalMXID, waid.MakeUserID(pcp.PhoneNumber)) {
+				continue
+			}
 			wrapped.Members.MemberMap.Add(bridgev2.ChatMember{
 				EventSender:    bridgev2.EventSender{Sender: waid.MakeUserID(pcp.PhoneNumber)},
 				Membership:     event.MembershipLeave,
@@ -327,7 +344,19 @@ func (wa *WhatsAppClient) wrapGroupInfo(ctx context.Context, info *types.GroupIn
 	} else {
 		wrapped.Type = ptr.Ptr(database.RoomTypeDefault)
 	}
+	wa.intboxRosterFromGroupInfo(ctx, info, wrapped) // intbox W2: persist roster + com.zeldin.group_info state event (intbox_roster.go)
 	return wrapped
+}
+
+func (wa *WhatsAppClient) getExistingPortalMXID(ctx context.Context, chatJID types.JID) id.RoomID {
+	portal, err := wa.Main.Bridge.GetExistingPortalByKey(ctx, wa.makeWAPortalKey(chatJID))
+	if err != nil {
+		zerolog.Ctx(ctx).Warn().Err(err).Stringer("chat_jid", chatJID).Msg("Failed to get existing portal")
+		return ""
+	} else if portal == nil {
+		return ""
+	}
+	return portal.MXID
 }
 
 func (wa *WhatsAppClient) wrapGroupInfoChange(ctx context.Context, evt *events.GroupInfo) *bridgev2.ChatInfoChange {
@@ -411,6 +440,7 @@ func (wa *WhatsAppClient) wrapGroupInfoChange(ctx context.Context, evt *events.G
 			}
 		}
 	}
+	changes = wa.intboxRosterFromGroupChange(ctx, evt, changes) // intbox W2: apply participant changes to the roster (intbox_roster.go)
 	return &bridgev2.ChatInfoChange{
 		ChatInfo:      changes,
 		MemberChanges: memberChanges,

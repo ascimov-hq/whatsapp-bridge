@@ -69,6 +69,9 @@ initial_auto_reconnect: true
 # the bridge? By default, the bridge only stores messages in memory, and therefore can't accept
 # retry receipts if the bridge is restarted after the message is sent.
 use_whatsapp_retry_store: false
+# Maximum size of groups to sync members eagerly in. Defaults to unlimited.
+# If set, groups with more than this number of members will not have non-admin participants synced until they talk.
+max_member_sync: -1
 
 # Settings for converting animated stickers.
 animated_sticker:
@@ -91,6 +94,20 @@ history_sync:
     # If -1, all conversations received from history sync will be bridged.
     # Other conversations will be backfilled on demand when receiving a message.
     max_initial_conversations: -1
+    # Maximum total number of conversations to create portals for per login, counted across all
+    # history sync dispatch rounds (max_initial_conversations above only applies to one round,
+    # and a new round starts every time a late history sync payload arrives).
+    # If 0, there is no per-login limit.
+    max_rooms_per_login: 0
+    # Maximum age of messages to backfill when a portal is created (initial forward backfill only).
+    # Must be a Go duration, e.g. 1440h for 60 days (the "d" unit is not supported).
+    # The backfill.max_initial_messages limit still applies on top of this. If 0, there is no age limit.
+    max_initial_age: 0s
+    # Maximum number of group info lookups per second when creating portals from history sync.
+    # The first 20 lookups per login are never paced. When set, the rate limit error backoff
+    # is also reset after a successful lookup instead of slowing down every following conversation.
+    # If 0, lookups are not paced.
+    group_info_lookups_per_second: 0
     # Should the bridge request a full sync from the phone when logging in?
     # This bumps the size of history syncs from 3 months to 1 year.
     request_full_sync: false
@@ -124,3 +141,75 @@ history_sync:
     # Use on-demand history sync requests for fetching older messages?
     # This only applies when using the backfill queue, never for forward backfills.
     backwards_on_demand: false
+
+# intbox onboarding capacity features. All of them are disabled by default (upstream behaviour).
+# The endpoints below are served under the provisioning API (/_matrix/provision/v3/intbox/...)
+# with the same authentication as the other provisioning endpoints.
+intbox:
+    # Group roster: persist the full participant list of groups (from the group info the bridge
+    # already fetches and from participant change events), serve it at GET /v3/intbox/roster
+    # and publish the group size in a com.zeldin.group_info state event in group portals.
+    # Useful together with max_member_sync, as silent members of big groups aren't in Matrix.
+    roster:
+        enabled: false
+    # Admission queue for history sync imports (portal creation and initial backfill after login).
+    # The queue position and progress of each login are available at GET /v3/intbox/onboarding
+    # even when the queue is disabled.
+    admission:
+        enabled: false
+        # Number of logins that may import their history at the same time.
+        max_concurrent_imports: 1
+        # Let the next queued login start early when fewer than this many rooms of the admitted
+        # logins are still importing. 0 disables early admission.
+        min_rooms_in_flight: 10
+        # Logins queue in pairing order. Small imports (at most max_rooms rooms in the first history
+        # sync round and at most max_messages buffered history messages; 0 = rooms only) get a lane
+        # of their own with max_concurrent slots on top of max_concurrent_imports, so a storm of
+        # small accounts neither queues in front of real onboardings nor waits behind big imports.
+        # 0 disables the lane.
+        small_imports:
+            max_rooms: 0
+            max_messages: 0
+            max_concurrent: 0
+        # Heavy imports (at least min_messages buffered history messages) may hold at most
+        # max_concurrent of the max_concurrent_imports slots; later normal logins can pass a heavy
+        # login that waits for a heavy slot. 0 disables the limit.
+        heavy_imports:
+            min_messages: 0
+            max_concurrent: 0
+    # History bypass: only backfill the newest messages of each chat into Matrix. Older history sync
+    # messages are kept by the bridge and served to the app at GET /v3/intbox/history/messages
+    # (without media) until the app acknowledges them at POST /v3/intbox/history/ack.
+    # Matrix and the bypass together deliver at most backfill.max_initial_messages messages per chat
+    # (older ones are dropped), all within history_sync.max_initial_age. Only the initial backfill of
+    # a chat fills the bypass.
+    history_bypass:
+        enabled: false
+        # Number of newest messages per chat that are still backfilled into Matrix. The bypass gets
+        # up to backfill.max_initial_messages minus this many older messages.
+        matrix_recent_messages: 200
+        # How long to keep bypassed history that hasn't been acknowledged. 0 keeps it forever.
+        retention: 720h
+    # How long to keep rows in the history sync buffer (messages received in history syncs that
+    # haven't been backfilled). Must be a Go duration, e.g. 720h. 0 keeps them forever.
+    history_buffer_retention: 0s
+    # When the same WhatsApp account is paired again less than this long after its history import
+    # started, keep the import state (chats already imported, the history_sync.max_rooms_per_login
+    # count and the last contact resync) instead of importing everything again. Chats that already
+    # have a room only get a catch-up backfill of messages they're missing, without a group info
+    # lookup or member sync. Must be a Go duration. 0 imports from scratch on every pairing.
+    reimport_after: 168h
+    # Minimum time between automatic contact resyncs of a login (the bridge resyncs contact names
+    # after every pairing). Must be a Go duration. 0 disables the cooldown. The sync contacts
+    # command always runs.
+    contact_resync_cooldown: 12h
+    # Refuse a pairing code request with HTTP 409 (FI.MAU.BRIDGE.ALREADY_LOGGED_IN) for a phone number
+    # whose login of the same Matrix user is connected right now, unless the login was started as an
+    # explicit re-login of it (?login_id= in the provisioning API). Pairing again would only link a
+    # duplicate device. Doesn't apply to QR logins (the number isn't known before pairing).
+    refuse_connected_repair: true
+    # Keep only one pending pairing code per phone number: a newer code request cancels the older
+    # login process of the same number (its pending step returns HTTP 410
+    # FI.MAU.BRIDGE.LOGIN_SUPERSEDED), unless that process already paired. WhatsApp only accepts the
+    # newest code anyway. Works across Matrix users, unlike provisioning.supersede_logins.
+    one_code_per_phone: true

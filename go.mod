@@ -8,6 +8,7 @@ tool go.mau.fi/util/cmd/maubuild
 
 require (
 	github.com/lib/pq v1.12.3
+	github.com/mattn/go-sqlite3 v1.14.45
 	github.com/rs/zerolog v1.35.1
 	github.com/tidwall/gjson v1.19.0
 	go.mau.fi/util v0.9.10
@@ -31,7 +32,6 @@ require (
 	github.com/kr/pretty v0.3.1 // indirect
 	github.com/mattn/go-colorable v0.1.14 // indirect
 	github.com/mattn/go-isatty v0.0.20 // indirect
-	github.com/mattn/go-sqlite3 v1.14.45 // indirect
 	github.com/petermattis/goid v0.0.0-20260330135022-df67b199bc81 // indirect
 	github.com/rogpeppe/go-internal v1.10.0 // indirect
 	github.com/rs/xid v1.6.0 // indirect
@@ -53,4 +53,4 @@ require (
 	maunium.net/go/mauflag v1.0.0 // indirect
 )
 
-replace maunium.net/go/mautrix => github.com/ascimov-hq/mautrix-go v0.0.0-20260925115222-5d80e6e67b4b
+replace maunium.net/go/mautrix => github.com/ascimov-hq/mautrix-go v0.0.0-20261005085439-03f3eac87dec

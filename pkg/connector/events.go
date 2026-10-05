@@ -352,6 +352,7 @@ func init() {
 func (evt *WAUndecryptableMessage) ConvertMessage(ctx context.Context, portal *bridgev2.Portal, intent bridgev2.MatrixAPI) (*bridgev2.ConvertedMessage, error) {
 	extra := map[string]any{
 		"fi.mau.whatsapp.undecryptable": true,
+		msgconv.WAMessageIDKey:          evt.Info.ID,
 	}
 	var broadcastListJID *types.JID
 	if evt.Info.IsIncomingBroadcast() {

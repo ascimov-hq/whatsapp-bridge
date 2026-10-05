@@ -94,7 +94,7 @@ func fnSync(ce *commands.Event) {
 		return
 	}
 	if len(ce.Args) == 0 {
-		ce.Reply("Usage: `$cmdprefix sync <group/groups/contacts/contacts-with-avatars/appstate>`")
+		ce.Reply("Usage: `$cmdprefix sync <group/groups/contacts/contacts-with-avatars/appstate> [--all]`")
 		return
 	}
 	logContext := func(c zerolog.Context) zerolog.Context {
@@ -140,10 +140,11 @@ func fnSync(ce *commands.Event) {
 		}
 		ce.Reply("Queued syncs for %d groups", len(groups))
 	case "contacts":
-		wa.resyncContacts(false, false)
+		// By default, only ghosts that are already in portal rooms are synced. Use --all to sync every contact.
+		wa.resyncContacts(false, false, slices.Contains(ce.Args[1:], "--all"))
 		ce.React("✅")
 	case "contacts-with-avatars":
-		wa.resyncContacts(true, false)
+		wa.resyncContacts(true, false, slices.Contains(ce.Args[1:], "--all"))
 		ce.React("✅")
 	case "appstate":
 		names := appstate.AllPatchNames[:]
