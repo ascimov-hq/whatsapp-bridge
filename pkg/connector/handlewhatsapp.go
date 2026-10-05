@@ -75,7 +75,15 @@ func init() {
 
 func (wa *WhatsAppClient) handleWAEvent(rawEvt any) (success bool) {
 	log := wa.UserLogin.Log
-	ctx := log.WithContext(wa.Main.Bridge.BackgroundCtx)
+	if !wa.isCurrent() {
+		// intbox: the event handlers of an instance are removed when it's retired (replaced by a re-pair or
+		// logged out), so this only catches events that were already being dispatched. A replaced instance
+		// shares the UserLogin with the new one and must not touch it. The new companion device receives its
+		// own copy of every message, so nothing is lost.
+		log.Debug().Type("event_type", rawEvt).Msg("Ignoring WhatsApp event of a replaced or logged out client instance")
+		return true
+	}
+	ctx := log.WithContext(wa.lifeContext())
 	wa.MC.OnWhatsAppEvent(rawEvt)
 
 	success = true
@@ -465,11 +473,20 @@ func (wa *WhatsAppClient) handleWAReceipt(ctx context.Context, evt *events.Recei
 	for i, id := range evt.MessageIDs {
 		targets[i] = waid.MakeMessageID(evt.Chat, messageSender, id)
 	}
+	portalKey := wa.makeWAPortalKey(evt.Chat)
+	sender := wa.makeEventSender(ctx, evt.Sender)
+	if wa.isNonMemberSender(ctx, portalKey, sender) {
+		zerolog.Ctx(ctx).Trace().
+			Stringer("chat_jid", evt.Chat).
+			Stringer("sender_jid", evt.Sender).
+			Msg("Ignoring receipt from user who isn't a member of the portal room")
+		return true
+	}
 	res := wa.UserLogin.QueueRemoteEvent(&simplevent.Receipt{
 		EventMeta: simplevent.EventMeta{
 			Type:      evtType,
-			PortalKey: wa.makeWAPortalKey(evt.Chat),
-			Sender:    wa.makeEventSender(ctx, evt.Sender),
+			PortalKey: portalKey,
+			Sender:    sender,
 			Timestamp: evt.Timestamp,
 		},
 		Targets: targets,
@@ -495,18 +512,50 @@ func (wa *WhatsAppClient) handleWAChatPresence(ctx context.Context, evt *events.
 	if evt.State == types.ChatPresencePaused {
 		timeout = 0
 	}
+	portalKey := wa.makeWAPortalKey(evt.Chat)
+	sender := wa.makeEventSender(ctx, evt.Sender)
+	if wa.isNonMemberSender(ctx, portalKey, sender) {
+		zerolog.Ctx(ctx).Trace().
+			Stringer("chat_jid", evt.Chat).
+			Stringer("sender_jid", evt.Sender).
+			Msg("Ignoring typing notification from user who isn't a member of the portal room")
+		return
+	}
 
 	wa.UserLogin.QueueRemoteEvent(&simplevent.Typing{
 		EventMeta: simplevent.EventMeta{
 			Type:       bridgev2.RemoteEventTyping,
 			LogContext: nil,
-			PortalKey:  wa.makeWAPortalKey(evt.Chat),
-			Sender:     wa.makeEventSender(ctx, evt.Sender),
+			PortalKey:  portalKey,
+			Sender:     sender,
 			Timestamp:  time.Now(),
 		},
 		Timeout: timeout,
 		Type:    typingType,
 	})
+}
+
+// isNonMemberSender checks if the sender of a read receipt or typing notification is a ghost that isn't
+// joined to the portal room. Such events can't be bridged anyway (the ghost would have to be in the room),
+// but bridgev2 would still create, register and fetch the profile and avatar of the ghost before failing.
+// With max_member_sync, most members of large groups are only added to the room when they first talk,
+// so this matters for every silent reader of the user's messages.
+func (wa *WhatsAppClient) isNonMemberSender(ctx context.Context, portalKey networkid.PortalKey, sender bridgev2.EventSender) bool {
+	if sender.IsFromMe || sender.Sender == "" {
+		return false
+	} else if sender.SenderLogin != "" && wa.Main.Bridge.GetCachedUserLoginByID(sender.SenderLogin) != nil {
+		// The sender is another user of this bridge, so the event may be sent through their double puppet
+		return false
+	}
+	portal, err := wa.Main.Bridge.GetExistingPortalByKey(ctx, portalKey)
+	if err != nil {
+		zerolog.Ctx(ctx).Warn().Err(err).Msg("Failed to get portal to check sender membership")
+		return false
+	} else if portal == nil || portal.MXID == "" {
+		// bridgev2 drops events for portals without a room before looking up the sender
+		return false
+	}
+	return !wa.isGhostJoinedToRoom(ctx, portal.MXID, sender.Sender)
 }
 
 func (wa *WhatsAppClient) handleWALogout(reason events.ConnectFailureReason, onConnect bool) {
@@ -516,11 +565,35 @@ func (wa *WhatsAppClient) handleWALogout(reason events.ConnectFailureReason, onC
 	} else if reason == events.ConnectFailureMainDeviceGone {
 		errorCode = WAMainDeviceGone
 	}
-	wa.Disconnect()
+	// intbox: check whether this instance is still the login's client before retiring it, and capture the
+	// metadata pointer now: bridgev2 replaces the whole metadata object when the account is paired again.
+	current := wa.isCurrent()
+	meta := wa.UserLogin.Metadata.(*waid.UserLoginMetadata)
+	log := wa.UserLogin.Log.With().
+		Str("action", "handle logout").
+		Stringer("device_jid", wa.JID).
+		Stringer("reason", reason).
+		Bool("on_connect", onConnect).
+		Logger()
+	// Stops this instance's background work (contact resync, ghost sync, history sync waiter) and closes the
+	// socket. whatsmeow has already deleted the device store.
+	wa.retire(log.WithContext(context.Background()), errClientLoggedOut, false)
+	if !current {
+		// The old companion device of a login that was paired again was unlinked (e.g. the user removed the
+		// duplicate linked device on the phone). The login uses a newer device: don't zero its device ID or
+		// mark it as logged out.
+		log.Info().Msg("Ignoring logout of a replaced client instance, the login uses a newer device")
+		return
+	}
+	log.Info().Msg("WhatsApp logged out this login")
 	wa.Client = nil
 	wa.JID = types.EmptyJID
-	wa.UserLogin.Metadata.(*waid.UserLoginMetadata).WADeviceID = 0
-	wa.UserLogin.BridgeState.Send(status.BridgeState{
+	meta.WADeviceID = 0
+	if !wa.isActiveInstance() {
+		// The login was paired again while this was running
+		return
+	}
+	wa.sendBridgeState(status.BridgeState{
 		StateEvent: status.StateBadCredentials,
 		Error:      errorCode,
 	})
@@ -665,7 +738,12 @@ func (wa *WhatsAppClient) syncGhost(jid types.JID, reason string, pictureID *str
 		Str("picture_id", ptr.Val(pictureID)).
 		Stringer("jid", jid).
 		Logger()
-	ctx := log.WithContext(wa.Main.Bridge.BackgroundCtx)
+	// intbox: runs on the instance's lifetime context, so a replaced or logged out instance stops syncing
+	ctx := log.WithContext(wa.lifeContext())
+	if ctx.Err() != nil || !wa.isCurrent() {
+		log.Debug().Msg("Not syncing ghost on a replaced or logged out client instance")
+		return
+	}
 	ghost, err := wa.Main.Bridge.GetGhostByID(ctx, waid.MakeUserID(jid))
 	if err != nil {
 		log.Err(err).Msg("Failed to get ghost")
@@ -837,9 +915,9 @@ func (wa *WhatsAppClient) handleWAAppStateSyncComplete(ctx context.Context, evt 
 		if err != nil {
 			log.Warn().Err(err).Msg("Failed to send presence after app state sync")
 		}
-		go wa.syncRemoteProfile(log.WithContext(context.Background()), nil)
+		go wa.syncRemoteProfile(log.WithContext(wa.lifeContext()), nil)
 	} else if evt.Name == appstate.WAPatchCriticalUnblockLow {
-		go wa.resyncContacts(false, true)
+		go wa.resyncContacts(false, true, false)
 	}
 	wa.appStateRecoveryLock.Lock()
 	defer wa.appStateRecoveryLock.Unlock()

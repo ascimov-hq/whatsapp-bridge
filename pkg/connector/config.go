@@ -52,14 +52,18 @@ type Config struct {
 	DirectMediaAutoRequest      bool          `yaml:"direct_media_auto_request"`
 	InitialAutoReconnect        bool          `yaml:"initial_auto_reconnect"`
 	UseWhatsAppRetryStore       bool          `yaml:"use_whatsapp_retry_store"`
+	MaxMemberSync               int           `yaml:"max_member_sync"`
 
 	AnimatedSticker msgconv.AnimatedStickerConfig `yaml:"animated_sticker"`
 
 	HistorySync struct {
-		MaxInitialConversations int           `yaml:"max_initial_conversations"`
-		RequestFullSync         bool          `yaml:"request_full_sync"`
-		DispatchWait            time.Duration `yaml:"dispatch_wait"`
-		FullSyncConfig          struct {
+		MaxInitialConversations   int           `yaml:"max_initial_conversations"`
+		MaxRoomsPerLogin          int           `yaml:"max_rooms_per_login"`
+		MaxInitialAge             time.Duration `yaml:"max_initial_age"`
+		GroupInfoLookupsPerSecond float64       `yaml:"group_info_lookups_per_second"`
+		RequestFullSync           bool          `yaml:"request_full_sync"`
+		DispatchWait              time.Duration `yaml:"dispatch_wait"`
+		FullSyncConfig            struct {
 			DaysLimit    uint32 `yaml:"days_limit"`
 			SizeLimit    uint32 `yaml:"size_mb_limit"`
 			StorageQuota uint32 `yaml:"storage_quota_mb"`
@@ -74,6 +78,9 @@ type Config struct {
 
 		BackwardsOnDemand bool `yaml:"backwards_on_demand"`
 	} `yaml:"history_sync"`
+
+	// intbox onboarding capacity features (W2 roster, W4 admission, L1 history bypass, W7 retention), see intbox.go
+	Intbox IntboxConfig `yaml:"intbox"`
 
 	displaynameTemplate *template.Template `yaml:"-"`
 }
@@ -129,6 +136,7 @@ func upgradeConfig(helper up.Helper) {
 	helper.Copy(up.Bool, "direct_media_auto_request")
 	helper.Copy(up.Bool, "initial_auto_reconnect")
 	helper.Copy(up.Bool, "use_whatsapp_retry_store")
+	helper.Copy(up.Int, "max_member_sync")
 
 	helper.Copy(up.Str, "animated_sticker", "target")
 	helper.Copy(up.Int, "animated_sticker", "args", "width")
@@ -136,6 +144,9 @@ func upgradeConfig(helper up.Helper) {
 	helper.Copy(up.Int, "animated_sticker", "args", "fps")
 
 	helper.Copy(up.Int, "history_sync", "max_initial_conversations")
+	helper.Copy(up.Int, "history_sync", "max_rooms_per_login")
+	helper.Copy(up.Str|up.Int, "history_sync", "max_initial_age")
+	helper.Copy(up.Int|up.Float, "history_sync", "group_info_lookups_per_second")
 	helper.Copy(up.Bool, "history_sync", "request_full_sync")
 	helper.Copy(up.Str|up.Int, "history_sync", "dispatch_wait")
 	helper.Copy(up.Int|up.Null, "history_sync", "full_sync_config", "days_limit")
@@ -146,6 +157,8 @@ func upgradeConfig(helper up.Helper) {
 	helper.Copy(up.Int, "history_sync", "media_requests", "request_local_time")
 	helper.Copy(up.Int, "history_sync", "media_requests", "max_async_handle")
 	helper.Copy(up.Bool, "history_sync", "backwards_on_demand")
+
+	upgradeIntboxConfig(helper)
 }
 
 type DisplaynameParams struct {
@@ -206,6 +219,7 @@ func (wa *WhatsAppConnector) GetConfig() (string, any, up.Upgrader) {
 			{"displayname_template"},
 			{"call_start_notices"},
 			{"history_sync"},
+			{"intbox"},
 		},
 		Base: ExampleConfig,
 	}

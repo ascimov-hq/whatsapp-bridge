@@ -23,6 +23,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"unicode/utf8"
 
 	"go.mau.fi/whatsmeow/proto/waE2E"
 	"maunium.net/go/mautrix/bridgev2"
@@ -42,8 +43,31 @@ func (mc *MessageConverter) convertTextMessage(ctx context.Context, msg *waE2E.M
 	}
 	contextInfo = msg.GetExtendedTextMessage().GetContextInfo()
 	mc.parseFormatting(part.Content, false, false)
+	if len(part.Content.FormattedBody) > 20000 {
+		part.Content.Body = part.Content.Body[:500] + "[...]"
+	}
+	if len(part.Content.FormattedBody) > 40000 {
+		part.Content.FormattedBody = part.Content.FormattedBody[:40000] + "<br><em>[long message cut off]</em>"
+	}
+	// The cuts above only apply to messages with formatting. Also cut long plain text messages,
+	// otherwise they don't fit in a Matrix event once encrypted (65535 byte PDU limit).
+	if len(part.Content.Body) > maxPlainBodyLength {
+		part.Content.Body = cutStringAtRuneBoundary(part.Content.Body, maxPlainBodyLength) + "\n[long message cut off]"
+	}
 	part.Content.BeeperLinkPreviews = mc.convertURLPreviewToBeeper(ctx, msg.GetExtendedTextMessage())
 	return
+}
+
+const maxPlainBodyLength = 40000
+
+func cutStringAtRuneBoundary(str string, maxLength int) string {
+	if len(str) <= maxLength {
+		return str
+	}
+	for maxLength > 0 && !utf8.RuneStart(str[maxLength]) {
+		maxLength--
+	}
+	return str[:maxLength]
 }
 
 func (mc *MessageConverter) parseFormatting(content *event.MessageEventContent, allowInlineURL, forceHTML bool) {

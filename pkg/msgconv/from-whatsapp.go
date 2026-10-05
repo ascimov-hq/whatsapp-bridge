@@ -23,6 +23,7 @@ import (
 	_ "image/gif"
 	_ "image/jpeg"
 	_ "image/png"
+	"maps"
 	"strings"
 	"time"
 
@@ -119,6 +120,11 @@ func (mc *MessageConverter) addMentions(ctx context.Context, mentionedJID []stri
 		into.FormattedBody = strings.ReplaceAll(into.FormattedBody, mentionText, fmt.Sprintf(`<a href="%s">%s</a>`, mxid.URI().MatrixToURL(), html.EscapeString(displayname)))
 	}
 }
+
+// WAMessageIDKey is the content key that holds the WhatsApp message ID in every message event bridged
+// from WhatsApp (live and backfill), so that clients can de-duplicate messages they also receive
+// from other sources (e.g. the history bypass API).
+const WAMessageIDKey = "com.zeldin.wa_message_id"
 
 var failedCommentPart = &bridgev2.ConvertedMessagePart{
 	Type: event.EventMessage,
@@ -225,6 +231,17 @@ func (mc *MessageConverter) ToMatrix(
 		part, contextInfo = mc.convertUnknownMessage(ctx, rawWaMsg)
 	}
 
+	// Copy the part so that the extra content below isn't added to shared static parts (like failedCommentPart)
+	part = ptr.Clone(part)
+	part.Extra = maps.Clone(part.Extra)
+	if part.Extra == nil {
+		part.Extra = make(map[string]any)
+	}
+	waMessageID := info.ID
+	if editTargetID := getEditTargetID(ctx); editTargetID != "" {
+		waMessageID = editTargetID
+	}
+	part.Extra[WAMessageIDKey] = waMessageID
 	part.Content.Mentions = &event.Mentions{}
 	if part.DBMetadata == nil {
 		part.DBMetadata = &waid.MessageMetadata{}

@@ -64,6 +64,10 @@ type WhatsAppConnector struct {
 	mediaEditCache         MediaEditCache
 	mediaEditCacheLock     sync.RWMutex
 	stopMediaEditCacheLoop atomic.Pointer[context.CancelFunc]
+
+	intbox intboxState
+	// intbox: login process with a pending pairing code per phone number (one code per phone, see login.go)
+	pendingPhoneLogins phoneLoginRegistry
 }
 
 func init() {
@@ -160,6 +164,7 @@ func (wa *WhatsAppConnector) Start(ctx context.Context) error {
 	if !wa.Bridge.Background && wa.Bridge.DB.KV.Get(ctx, "whatsapp_lid_dms_deleted") == "false" {
 		wa.deleteLIDDMsMigration(ctx)
 	}
+	wa.startIntbox(ctx)
 
 	return nil
 }
